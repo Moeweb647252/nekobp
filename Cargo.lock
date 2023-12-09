@@ -664,6 +664,7 @@ dependencies = [
  "futures-util",
  "log",
  "ntex",
+ "num_cpus",
  "reqwest",
  "tokio",
 ]
