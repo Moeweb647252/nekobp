@@ -88,6 +88,7 @@ async fn main() -> io::Result<()> {
             ))
     })
     .bind((addr, port))?
+    .workers(num_cpus::get())
     .run()
     .await
 }
