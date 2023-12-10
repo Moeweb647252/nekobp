@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use log::{info, warn};
-use ntex::web;
+use ntex::{util::Bytes, web};
 use std::io::{self, Write};
 
 fn input(prompt: &str) -> io::Result<String> {
@@ -13,14 +13,35 @@ fn input(prompt: &str) -> io::Result<String> {
     Ok(buf)
 }
 
+fn handel_resp(resp: reqwest::Response) -> web::HttpResponse {
+    info!("Streaming: {}", resp.url());
+    let mut builder = web::HttpResponse::Ok();
+    builder.content_type(
+        resp.headers()
+            .get("Content-Type")
+            .map(|t| t.to_str().unwrap_or("application/octet-stream"))
+            .unwrap_or("application/octet-stream"),
+    );
+    if let Some(t) = resp.content_length() {
+        builder.content_length(t);
+    }
+    let stream = resp
+        .bytes_stream()
+        .map(|s| s.map(|s| ntex::util::Bytes::from(s.to_vec())));
+    return builder.streaming(stream);
+}
+
 async fn hello() -> &'static str {
     "Hello"
 }
 
-async fn dl(path: web::types::Path<(String, String)>, req: web::HttpRequest) -> web::HttpResponse {
+async fn dl(
+    path: web::types::Path<(String, String)>,
+    req: web::HttpRequest,
+    body: Bytes,
+) -> web::HttpResponse {
     let host = &path.0;
     let path = &path.1;
-    info!("Streaming: {}/{}", host, path);
     let builder = reqwest::Client::builder();
     let client = match builder.build() {
         Ok(client) => client,
@@ -29,33 +50,35 @@ async fn dl(path: web::types::Path<(String, String)>, req: web::HttpRequest) -> 
             return web::HttpResponse::ServiceUnavailable().body("503");
         }
     };
-    let resp = match req.method().as_str() {
-        "GET" => client.get(format!("http://{}/{}", host, path)).send(),
+    match match req.method().as_str() {
+        "GET" => client.get(format!("https://{}/{}", host, path)),
+        "POST" => client.post(format!("https://{}/{}", host, path)),
         _ => {
             return web::HttpResponse::ServiceUnavailable().body("503");
         }
-    };
-    match resp.await {
-        Ok(resp) => {
-            let mut builder = web::HttpResponse::Ok();
-            builder.content_type(
-                resp.headers()
-                    .get("Content-Type")
-                    .map(|t| t.to_str().unwrap_or("application/octet-stream"))
-                    .unwrap_or("application/octet-stream"),
-            );
-            if let Some(t) = resp.content_length() {
-                builder.content_length(t);
+    }
+    .query(req.query_string())
+    .body(body.to_vec())
+    .send()
+    .await
+    {
+        Ok(resp) => return handel_resp(resp),
+        Err(_) => match match req.method().as_str() {
+            "GET" => client.get(format!("http://{}/{}", host, path)),
+            "POST" => client.post(format!("http://{}/{}", host, path)),
+            _ => return web::HttpResponse::ServiceUnavailable().body("503"),
+        }
+        .query(req.query_string())
+        .body(body.to_vec())
+        .send()
+        .await
+        {
+            Ok(resp) => return handel_resp(resp),
+            Err(error) => {
+                warn!("Error making request to {}/{}: {}", host, path, error);
+                return web::HttpResponse::ServiceUnavailable().body("503");
             }
-            let stream = resp
-                .bytes_stream()
-                .map(|s| s.map(|s| ntex::util::Bytes::from(s.to_vec())));
-            return builder.streaming(stream);
-        }
-        Err(error) => {
-            warn!("Error making request to {}/{}: {}", host, path, error);
-            return web::HttpResponse::ServiceUnavailable().body("503");
-        }
+        },
     }
 }
 
@@ -67,7 +90,10 @@ async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let usage = format!("Usage: {} [addr] / [ip] [port]", args[0]);
     let (addr, port) = match args.len() {
-        1 => (input("addr:")?, input("port:")?.parse().expect(&usage)),
+        1 => (
+            input("addr:")?.trim().to_string(),
+            input("port:")?.trim().parse().expect(&usage),
+        ),
         2 => {
             let mut args = args[1].split(":");
             (
