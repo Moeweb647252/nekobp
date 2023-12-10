@@ -7,14 +7,13 @@ fn input(prompt: &str) -> io::Result<String> {
     io::stdout().write(prompt.as_bytes())?;
     io::stdout().flush()?;
     let mut buf = String::new();
-    std::io::stdin().read_line(&mut buf)?;
+    io::stdin().read_line(&mut buf)?;
     #[cfg(debug_assertions)]
     info!("input: {}", buf);
     Ok(buf)
 }
 
 fn handel_resp(resp: reqwest::Response) -> web::HttpResponse {
-    info!("Streaming: {}", resp.url());
     let mut builder = web::HttpResponse::Ok();
     builder.content_type(
         resp.headers()
@@ -40,7 +39,13 @@ async fn dl(
     req: web::HttpRequest,
     body: Bytes,
 ) -> web::HttpResponse {
-    info!("Query: {}", req.query_string())
+    let mut query = Vec::new();
+    for i in req.query_string().split("&") {
+        let mut i = i.split("=");
+        if let (Some(k), Some(v)) = (i.next(), i.next()) {
+            query.push((k.to_string(), v.to_string()))
+        }
+    }
     let host = &path.0;
     let path = &path.1;
     let builder = reqwest::Client::builder();
@@ -58,7 +63,7 @@ async fn dl(
             return web::HttpResponse::ServiceUnavailable().body("503");
         }
     }
-    .query(req.query_string())
+    .query(&query)
     .body(body.to_vec())
     .send()
     .await
@@ -69,6 +74,7 @@ async fn dl(
             "POST" => client.post(format!("http://{}/{}", host, path)),
             _ => return web::HttpResponse::ServiceUnavailable().body("503"),
         }
+        .query(&query)
         .body(body.to_vec())
         .send()
         .await
