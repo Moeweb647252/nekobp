@@ -40,6 +40,7 @@ async fn dl(
     req: web::HttpRequest,
     body: Bytes,
 ) -> web::HttpResponse {
+    info!("Query: {}", req.query_string())
     let host = &path.0;
     let path = &path.1;
     let builder = reqwest::Client::builder();
@@ -68,7 +69,6 @@ async fn dl(
             "POST" => client.post(format!("http://{}/{}", host, path)),
             _ => return web::HttpResponse::ServiceUnavailable().body("503"),
         }
-        .query(req.query_string())
         .body(body.to_vec())
         .send()
         .await
