@@ -6,7 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-trait = "0.1.75"
 env_logger = "0.10.1"
+futures = "0.3.29"
 futures-util = "0.3.29"
 log = "0.4.20"
 ntex = { version = "0.7.13", features = ["tokio"] }
