@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use futures_util::StreamExt;
 use log::{info, warn};
 use ntex::{util::Bytes, web};
@@ -6,7 +8,7 @@ use std::{
     io::{self, Write},
 };
 
-const HOST: &str = "073.pw";
+const ZERO_BUF: [u8; 10240] = [0 as u8; 10240];
 
 fn input(prompt: &str) -> io::Result<String> {
     io::stdout().write(prompt.as_bytes())?;
@@ -19,9 +21,7 @@ fn input(prompt: &str) -> io::Result<String> {
 }
 
 trait HandelResp {
-    fn handel_stream_resp(resp: reqwest::Response) -> web::HttpResponse;
-    fn handel_resp(headers: reqwest::header::HeaderMap, content: Vec<u8>) -> web::HttpResponse;
-    fn is_stream() -> bool;
+    async fn handel_resp(resp: reqwest::Response, req: &web::HttpRequest) -> web::HttpResponse;
 }
 
 struct Zero;
@@ -29,14 +29,14 @@ struct Zero;
 impl Iterator for Zero {
     type Item = Result<ntex::util::Bytes, Infallible>;
     fn next(&mut self) -> Option<Self::Item> {
-        Some(ntex::util::Bytes::try_from(vec![0 as u8; 1024]))
+        Some(ntex::util::Bytes::try_from(&ZERO_BUF[..]))
     }
 }
 
 struct HandelDlResp;
 
 impl HandelResp for HandelDlResp {
-    fn handel_stream_resp(resp: reqwest::Response) -> web::HttpResponse {
+    async fn handel_resp(resp: reqwest::Response, _: &web::HttpRequest) -> web::HttpResponse {
         let mut builder = web::HttpResponse::Ok();
         resp.headers()
             .iter()
@@ -49,36 +49,41 @@ impl HandelResp for HandelDlResp {
             .map(|s| s.map(|s| ntex::util::Bytes::from(s.to_vec())));
         return builder.streaming(stream);
     }
-    fn handel_resp(_: reqwest::header::HeaderMap, _: Vec<u8>) -> web::HttpResponse {
-        todo!()
-    }
-    fn is_stream() -> bool {
-        true
-    }
 }
 
-struct HandelMikananiResp;
+struct HandelDocResp;
 
-impl HandelResp for HandelMikananiResp {
-    fn handel_resp(headers: reqwest::header::HeaderMap, content: Vec<u8>) -> web::HttpResponse {
+impl HandelResp for HandelDocResp {
+    async fn handel_resp(resp: reqwest::Response, req: &web::HttpRequest) -> web::HttpResponse {
         let mut builder = web::HttpResponse::Ok();
+        let headers = resp.headers();
         headers
             .iter()
             .map(|i| (i.0.to_string(), i.1.to_str().unwrap_or("").to_string()))
             .for_each(|i| {
                 builder.set_header(i.0, i.1);
             });
-        if let Ok(content) = String::from_utf8(content) {
-            builder.body(content.replace("https://", format!("https://{}/", HOST).as_str()))
+        let host_and_port = format!(
+            "{}:{}",
+            req.uri().host().unwrap_or("unknown"),
+            req.uri()
+                .port()
+                .map(|v| v.as_str().to_string())
+                .unwrap_or("443".to_string())
+        );
+        if let Ok(content) = resp.bytes().await {
+            if let Ok(content) = String::from_utf8(content.to_vec()) {
+                builder.body(
+                    content
+                        .replace("https://", format!("https://{}/", host_and_port).as_str())
+                        .replace("http://", format!("http://{}/", host_and_port).as_str()),
+                )
+            } else {
+                builder.body("")
+            }
         } else {
-            builder.body("")
+            web::HttpResponse::ServiceUnavailable().body("")
         }
-    }
-    fn handel_stream_resp(_: reqwest::Response) -> web::HttpResponse {
-        todo!()
-    }
-    fn is_stream() -> bool {
-        false
     }
 }
 
@@ -114,61 +119,42 @@ async fn dl<T: HandelResp>(
             return web::HttpResponse::ServiceUnavailable().body("503");
         }
     };
-    match match req.method().as_str() {
-        "GET" => client.get(format!("https://{}/{}", host, path)),
-        "POST" => client.post(format!("https://{}/{}", host, path)),
-        _ => {
-            return web::HttpResponse::ServiceUnavailable().body("503");
-        }
-    }
-    .query(&query)
-    .body(body.to_vec())
-    .send()
-    .await
-    {
-        Ok(resp) => {
-            return match T::is_stream() {
-                true => T::handel_stream_resp(resp),
-
-                false => {
-                    let headers = resp.headers().clone();
-                    if let Ok(content) = resp.bytes().await {
-                        T::handel_resp(headers, content.to_vec())
-                    } else {
-                        web::HttpResponse::ServiceUnavailable().body("")
-                    }
-                }
+    let mut https_failed = false;
+    let mut url = format!("https://{}/{}", host, path);
+    loop {
+        match match req.method().as_str() {
+            "GET" => client.get(url),
+            "POST" => client.post(url),
+            _ => {
+                return web::HttpResponse::ServiceUnavailable().body("503");
             }
-        }
-        Err(_) => match match req.method().as_str() {
-            "GET" => client.get(format!("http://{}/{}", host, path)),
-            "POST" => client.post(format!("http://{}/{}", host, path)),
-            _ => return web::HttpResponse::ServiceUnavailable().body("503"),
         }
         .query(&query)
         .body(body.to_vec())
+        .headers(
+            (&req
+                .headers()
+                .iter()
+                .map(|v| (v.0.to_string(), v.1.to_str().unwrap().to_string()))
+                .filter(|v| v.0.to_uppercase().ne("HOST"))
+                .collect::<std::collections::HashMap<String, String>>())
+                .try_into()
+                .unwrap(),
+        )
         .send()
         .await
         {
-            Ok(resp) => {
-                return match T::is_stream() {
-                    true => T::handel_stream_resp(resp),
-
-                    false => {
-                        let headers = resp.headers().clone();
-                        if let Ok(content) = resp.bytes().await {
-                            T::handel_resp(headers, content.to_vec())
-                        } else {
-                            web::HttpResponse::ServiceUnavailable().body("")
-                        }
-                    }
-                }
-            }
+            Ok(resp) => break T::handel_resp(resp, &req).await,
             Err(error) => {
+                if !https_failed {
+                    url = format!("http://{}/{}", host, path);
+                    https_failed = true;
+                    continue;
+                }
                 warn!("Error making request to {}/{}: {}", host, path, error);
-                return web::HttpResponse::ServiceUnavailable().body("503");
+                break web::HttpResponse::ServiceUnavailable().body("503");
             }
-        },
+        }
     }
 }
 
@@ -199,7 +185,7 @@ async fn main() -> io::Result<()> {
             // enable logger
             .wrap(web::middleware::Logger::default())
             .service((
-                web::resource("rss/{domain}/{path}*").to(dl::<HandelMikananiResp>),
+                web::resource("doc/{domain}/{path}*").to(dl::<HandelDocResp>),
                 web::resource("{domain}/{path}*").to(dl::<HandelDlResp>),
                 web::resource("").to(hello),
                 web::resource("zero").to(zero),
